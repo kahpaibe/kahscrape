@@ -1,7 +1,7 @@
 import asyncio
 import aiohttp
 from aiohttp import ClientResponse, ClientSession
-from asyncio import Queue
+from asyncio import Queue, LifoQueue
 from typing import Optional, Callable
 from dataclasses import dataclass
 from logging import Logger
@@ -34,7 +34,7 @@ class KahBaseFetcher(FetcherABC):
         """
         super().__init__()
         self.logger = logger
-        self.queue: Queue[KahReq | None] = Queue()
+        self.queue: Queue[KahReq | None] = LifoQueue() # Lifo allows limiting queue size due to branching
         self.session = session if session is not None else aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout))
         self.num_workers: int = num_workers
         self.running = True
