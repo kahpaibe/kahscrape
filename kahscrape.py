@@ -128,6 +128,7 @@ class CongestionController:
     """Rate limit on fetch fails, inspired by AIMD-type algorithms."""
     def __init__(self,
                  min_wait_time: float = 0.5,
+                 cc_max_wait_time: float = 90.0,
                  backoff_factor: float = 2.0,
                  success_additive_decrease: float = 0.5,
                  ):
@@ -140,6 +141,7 @@ class CongestionController:
         """
         self.wait_time = min_wait_time
         self.min_wait_time = min_wait_time
+        self.max_wait_time = cc_max_wait_time
         self.backoff_factor = backoff_factor
         self.success_additive_decrease = success_additive_decrease
         self.lock = asyncio.Lock()
@@ -157,7 +159,7 @@ class CongestionController:
     # After fetch
     def on_fetch_success(self):
         """If success, decrease wait time linearly."""
-        self.wait_time = max(self.min_wait_time, self.wait_time - self.success_additive_decrease)
+        self.wait_time = min(max(self.min_wait_time, self.wait_time - self.success_additive_decrease), self.max_wait_time)
 
     def on_fetch_failure(self):
         """If failure, increase wait time exponentially"""
@@ -169,15 +171,17 @@ class KahRatelimitedFetcher(KahBaseFetcher):
     congestion_controllers: dict[str, CongestionController] = {}
 
     def __init__(self, 
-                 num_workers: int = 4,
+                 num_workers: int = 10,
                  session: Optional[ClientSession] = None,
                  timeout: float = 10.0,
                  cc_min_wait_time: float = 0.5,
+                 cc_max_wait_time: float = 0.5,
                  cc_backoff_factor: float = 2.0,
                  cc_success_additive_decrease: float = 0.5,
                  logger: Optional[Logger] = None) -> None:
         super().__init__(num_workers, timeout, session, logger=logger)
         self.cc_min_wait_time = cc_min_wait_time
+        self.cc_max_wait_time = cc_max_wait_time
         self.cc_backoff_factor = cc_backoff_factor
         self.cc_success_additive_decrease = cc_success_additive_decrease
     
