@@ -1,40 +1,41 @@
 import asyncio
 import aiohttp
-from aiohttp import ClientResponse
+from aiohttp import ClientResponse, ClientSession
 from asyncio import Queue
 from typing import Optional, Callable
 from dataclasses import dataclass
 from logging import Logger
 
-from lib.kahscrape_utils import get_domain
-from lib.kahscrape_structs import FetcherABC
+from .lib.kahscrape_utils import get_domain
+from .lib.kahscrape_structs import FetcherABC
 
-from typing import override
+from typing import override, Awaitable, Tuple
 
 @dataclass
 class KahReq:
     url: str
-    callback: Callable[[ClientResponse, bytes], None] # (response, data)
-    onerror: Callable[[str, Exception, ClientResponse | None, bytes | None], None] # (url, e, [Optional response, Optional data])
+    callback: Callable[[FetcherABC, ClientResponse, bytes], Awaitable[None]] # (fetcher, response, data)
+    onerror: Callable[[FetcherABC, str, Exception, ClientResponse | None, bytes | None], Awaitable[None]] # (fetcher, url, e, [Optional response, Optional data])
 
 class KahBaseFetcher(FetcherABC):
     """Base async fetcher."""
     def __init__(self, 
                  num_workers: int,
                  timeout: float = 10.0,
+                 session: Optional[ClientSession] = None,
                  logger: Optional[Logger] = None) -> None:
         """Base async fetcher.
         
         Args:
             num_workers (int): Number of worker threads.
-            timeout (float): Timeout for fetch.
+            timeout (float): Timeout for fetch (for unset session).
+            session (Optional[ClientSession]): Optional aiohttp ClientSession.
             logger (Optional[Logger]): Optional Logger.
         """
         super().__init__()
         self.logger = logger
         self.queue: Queue[KahReq | None] = Queue()
-        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout))
-        
+        self.session = session if session is not None else aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout))
         self.num_workers: int = num_workers
         self.running = True
         self._start_workers()
@@ -46,10 +47,10 @@ class KahBaseFetcher(FetcherABC):
 
     @override
     async def fetch(self, 
-                      url: str, 
-                      callback: Callable[[ClientResponse, bytes], None], # (response, data)
-                      onerror: Callable[[str, Exception, ClientResponse | None, bytes | None], None], # (url, e, [Optional response, Optional data])
-                      ) -> None:
+                    url: str, 
+                    callback: Callable[[FetcherABC, ClientResponse, bytes], Awaitable[None]], # (fetcher, response, data)
+                    onerror: Callable[[FetcherABC, str, Exception, ClientResponse | None, bytes | None], Awaitable[None]], # (fetcher, url, e, [Optional response, Optional data])
+                    ) -> None:
         """Fetch given url."""
         if self.running is False: # Prevents further fetching
             if self.logger:
@@ -60,6 +61,31 @@ class KahBaseFetcher(FetcherABC):
 
         req = KahReq(url=url, callback=callback, onerror=onerror)
         await self.queue.put(req)
+
+    async def fetch_now(self, 
+                        url: str,
+                        onerror: Callable[[FetcherABC, str, Exception, ClientResponse | None, bytes | None], Awaitable[None]], # (fetcher, url, e, [Optional response, Optional data])
+                        ) -> Tuple[ClientResponse, bytes] | None:
+        """Fetch given url without going to queue."""
+        if self.running is False: # Prevents further fetching
+            if self.logger:
+                self.logger.warning(f"Fetcher is not running, cannot add fetch request. {url=}")
+            return
+        if self.logger:
+            self.logger.info(f"Fetching url {url=}")
+
+        try:
+            resp_buffer, data = None, None # default in case of exception
+            async with self.session.get(url) as resp:
+                resp_buffer = resp
+                data = await resp.read()
+                if self.logger:
+                    self.logger.info(f"Fetched {url} successfully. ({len(data)} bytes)")
+            return resp_buffer, data
+        
+        except Exception as e:
+            await onerror(self, url, e, resp_buffer, data)
+
 
     @override
     async def close(self) -> None:
@@ -72,6 +98,11 @@ class KahBaseFetcher(FetcherABC):
         await self.queue.join()  # Wait for all fetch jobs to be processed
         await self.session.close()  # Close the aiohttp session
     
+    async def wait_and_close(self) -> None:
+        """Wait for the queue to be empty and close."""
+        await self.queue.join()  # Wait for all fetch jobs to be processed
+        await self.session.close()  # Close the aiohttp session
+
     async def _worker(self):
         """Worker instance"""
         while True:
@@ -87,9 +118,9 @@ class KahBaseFetcher(FetcherABC):
                     data = await resp.read()
                     if self.logger:
                         self.logger.info(f"Fetched {req.url} successfully. ({len(data)} bytes)")
-                    req.callback(resp, data)
+                    await req.callback(self, resp, data)
             except Exception as e:
-                req.onerror(req.url, e, resp_buffer, data)
+                await req.onerror(self, req.url, e, resp_buffer, data)
             finally:
                 self.queue.task_done() # Notify completion
 
@@ -138,16 +169,53 @@ class KahRatelimitedFetcher(KahBaseFetcher):
     congestion_controllers: dict[str, CongestionController] = {}
 
     def __init__(self, 
-                 num_workers: int,
+                 num_workers: int = 4,
+                 session: Optional[ClientSession] = None,
                  timeout: float = 10.0,
                  cc_min_wait_time: float = 0.5,
                  cc_backoff_factor: float = 2.0,
                  cc_success_additive_decrease: float = 0.5,
                  logger: Optional[Logger] = None) -> None:
-        super().__init__(num_workers, timeout, logger=logger)
+        super().__init__(num_workers, timeout, session, logger=logger)
         self.cc_min_wait_time = cc_min_wait_time
         self.cc_backoff_factor = cc_backoff_factor
         self.cc_success_additive_decrease = cc_success_additive_decrease
+    
+    @override
+    async def fetch_now(self, 
+                        url: str,
+                        onerror: Callable[[FetcherABC, str, Exception, ClientResponse | None, bytes | None], Awaitable[None]], # (fetcher, url, e, [Optional response, Optional data])
+                        ) -> Tuple[ClientResponse, bytes] | None:
+        """Fetch given url without going to queue."""
+        if self.running is False: # Prevents further fetching
+            if self.logger:
+                self.logger.warning(f"Fetcher is not running, cannot add fetch request. {url=}")
+            return
+        if self.logger:
+            self.logger.info(f"Fetching url {url=}")
+
+        domain = get_domain(url) # Get domain
+        if domain not in self.congestion_controllers:
+            KahRatelimitedFetcher.congestion_controllers[domain] = CongestionController(
+                self.cc_min_wait_time,
+                self.cc_backoff_factor,
+                self.cc_success_additive_decrease,
+                )
+        cc = KahRatelimitedFetcher.congestion_controllers[domain]
+
+        try:
+            await cc.consume() # Wait for corresponding time
+
+            resp_buffer, data = None, None # default in case of exception
+            async with self.session.get(url) as resp:
+                resp_buffer = resp
+                data = await resp.read()
+                if self.logger:
+                    self.logger.info(f"Fetched {url} successfully. ({len(data)} bytes)")
+            return resp_buffer, data
+        
+        except Exception as e:
+            await onerror(self, url, e, resp_buffer, data)
 
     async def _worker(self):
         """Worker instance"""
@@ -177,10 +245,10 @@ class KahRatelimitedFetcher(KahBaseFetcher):
                         self.logger.info(f"Fetched {req.url} successfully. ({len(data)} bytes)")
                     cc.on_fetch_success()
 
-                    req.callback(resp, data)
+                    await req.callback(self, resp, data)
             except Exception as e:
                 cc.on_fetch_failure()
-                req.onerror(req.url, e, resp_buffer, data)
+                await req.onerror(self, req.url, e, resp_buffer, data)
             finally:
                 self.queue.task_done() # Notify completion
 

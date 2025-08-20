@@ -1,7 +1,8 @@
-from abc import abstractmethod, ABC
-from typing import Callable
-# from enum import StrEnum
 import asyncio
+from abc import abstractmethod, ABC
+from typing import Callable, Awaitable
+from aiohttp import ClientResponse
+# from enum import StrEnum
 
 class FetcherABC(ABC):
     """Make http requests."""
@@ -11,10 +12,10 @@ class FetcherABC(ABC):
 
     @abstractmethod
     async def fetch(self, 
-                      url: str, 
-                      callback: Callable[[str, bytes], None], # (url, data)
-                      onerror: Callable[[str, Exception], None], # (url, e)
-                      ) -> None:
+                    url: str, 
+                    callback: Callable[["FetcherABC", ClientResponse, bytes], Awaitable[None]], # (fetcher, response, data)
+                    onerror: Callable[["FetcherABC", str, Exception, ClientResponse | None, bytes | None], Awaitable[None]], # (fetcher, url, e, [Optional response, Optional data])
+                    ) -> None:
         """Request given url."""
         raise NotImplementedError()
     
@@ -24,10 +25,10 @@ class FetcherABC(ABC):
         raise NotImplementedError()
     
     def fetch_non_async(self,
-                      url: str, 
-                      callback: Callable[[str, bytes], None], # (url, data)
-                      onerror: Callable[[str, Exception], None], # (url, e)
-                      ) -> None:
+                        url: str, 
+                        callback: Callable[["FetcherABC", ClientResponse, bytes], Awaitable[None]], # (fetcher, response, data)
+                        onerror: Callable[["FetcherABC", str, Exception, ClientResponse | None, bytes | None], Awaitable[None]], # (fetcher, url, e, [Optional response, Optional data])
+                        ) -> None:
         """Add fetch from non async context"""
         asyncio.run(self.fetch(url, callback, onerror))
 
