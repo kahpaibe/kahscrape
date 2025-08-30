@@ -1,13 +1,13 @@
 import asyncio
 import aiohttp
 from aiohttp import ClientResponse, ClientSession
-from asyncio import Queue, LifoQueue
+from asyncio import PriorityQueue
 from typing import Optional, Callable
 from dataclasses import dataclass
 from logging import Logger
 
 from .lib.kahscrape_utils import get_domain
-from .lib.kahscrape_structs import FetcherABC
+from .lib.kahscrape_structs import FetcherABC, ToretryException, ToskipException
 
 from typing import override, Awaitable, Tuple
 
@@ -16,6 +16,7 @@ class KahReq:
     url: str
     callback: Callable[[FetcherABC, ClientResponse, bytes], Awaitable[None]] # (fetcher, response, data)
     onerror: Callable[[FetcherABC, str, Exception, ClientResponse | None, bytes | None], Awaitable[None]] # (fetcher, url, e, [Optional response, Optional data])
+    num_fetch: int = 1  # Number of fetch try
 
 class KahBaseFetcher(FetcherABC):
     """Base async fetcher."""
@@ -23,6 +24,7 @@ class KahBaseFetcher(FetcherABC):
                  num_workers: int,
                  timeout: float = 10.0,
                  session: Optional[ClientSession] = None,
+                 max_retries: int = 5,
                  logger: Optional[Logger] = None) -> None:
         """Base async fetcher.
         
@@ -30,14 +32,19 @@ class KahBaseFetcher(FetcherABC):
             num_workers (int): Number of worker threads.
             timeout (float): Timeout for fetch (for unset session).
             session (Optional[ClientSession]): Optional aiohttp ClientSession.
+            max_retries (int): Maximum number of retries for failed requests.
             logger (Optional[Logger]): Optional Logger.
         """
         super().__init__()
         self.logger = logger
-        self.queue: Queue[KahReq | None] = LifoQueue() # Lifo allows limiting queue size due to branching
         self.session = session if session is not None else aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout))
         self.num_workers: int = num_workers
         self.running = True
+        self.queue: PriorityQueue[tuple[int, KahReq | None]] = PriorityQueue()
+        self.fetch_positive_counter = 1  # Used for fetch retries
+        self.fetch_negative_counter = -1 # Used for new fetches
+        self.max_retries = max_retries
+        self._worker_count = 0
         self._start_workers()
 
     def _start_workers(self):
@@ -60,7 +67,8 @@ class KahBaseFetcher(FetcherABC):
             self.logger.info(f"Adding new fetch to queue. {url=}")
 
         req = KahReq(url=url, callback=callback, onerror=onerror)
-        await self.queue.put(req)
+        self.fetch_negative_counter -= 1 # Go down further (highest priority)
+        await self.queue.put((self.fetch_negative_counter, req))
 
     async def fetch_now(self, 
                         url: str,
@@ -74,18 +82,28 @@ class KahBaseFetcher(FetcherABC):
         if self.logger:
             self.logger.info(f"Fetching url {url=}")
 
-        try:
-            resp_buffer, data = None, None # default in case of exception
-            async with self.session.get(url) as resp:
-                resp_buffer = resp
-                data = await resp.read()
-                if self.logger:
-                    self.logger.info(f"Fetched {url} successfully. ({len(data)} bytes)")
-            return resp_buffer, data
-        
-        except Exception as e:
-            await onerror(self, url, e, resp_buffer, data)
-
+        for i in range(self.max_retries): # At most self.max_retries retry
+            if i > 0 and self.logger:
+                self.logger.info(f"Retrying fetch {url=}, attempt {i+1}/{self.max_retries}")
+            try: 
+                try:
+                    resp_buffer, data = None, None # default in case of exception
+                    async with self.session.get(url) as resp:
+                        resp_buffer = resp
+                        data = await resp.read()
+                        if self.logger:
+                            self.logger.info(f"Fetched {url} successfully. ({len(data)} bytes)")
+                    return resp_buffer, data
+                
+                except Exception as e:
+                    await onerror(self, url, e, resp_buffer, data)
+                    raise ToretryException(i)
+                
+            except ToretryException: # Try again
+                await asyncio.sleep(0.1) # Allow asyncio to do something else
+                continue
+        if self.logger:
+            self.logger.info(f"Max retries reached for fetch {url=}, giving up.")
 
     @override
     async def close(self) -> None:
@@ -93,7 +111,8 @@ class KahBaseFetcher(FetcherABC):
         # === Stop all workers (once they are done) ===
         self.running = False
         for _ in range(self.num_workers):
-            await self.queue.put(None)
+            self.fetch_positive_counter += 1 # Go up further (lowest priority, done at the end)
+            await self.queue.put((self.fetch_positive_counter, None))
         
         await self.queue.join()  # Wait for all fetch jobs to be processed
         await self.session.close()  # Close the aiohttp session
@@ -105,24 +124,50 @@ class KahBaseFetcher(FetcherABC):
 
     async def _worker(self):
         """Worker instance"""
+        self._worker_count += 1
+        worker_id = self._worker_count
+
         while True:
-            req = await self.queue.get()
+            item = await self.queue.get()
+            req = item[1]
             if req is None: # Shutdown signal
                 self.queue.task_done() # Notify completion
+                if self.logger:
+                    self.logger.info(f"Worker {worker_id} shutting down.")
                 break
-
+            
             try:
-                resp_buffer, data = None, None # default in case of exception
-                async with self.session.get(req.url) as resp:
-                    resp_buffer = resp
-                    data = await resp.read()
+                try:
+                    resp_buffer, data = None, None # default in case of exception
+                    async with self.session.get(req.url) as resp:
+                        resp_buffer = resp
+                        data = await resp.read()
+                        if self.logger:
+                            self.logger.info(f"Fetched {req.url} successfully. ({len(data)} bytes)")
+                        await req.callback(self, resp, data)
+                except Exception as e:
+                    await req.onerror(self, req.url, e, resp_buffer, data)
+                    raise e # Go up
+
+            except ToretryException:
+                if req.num_fetch >= self.max_retries:
                     if self.logger:
-                        self.logger.info(f"Fetched {req.url} successfully. ({len(data)} bytes)")
-                    await req.callback(self, resp, data)
-            except Exception as e:
-                await req.onerror(self, req.url, e, resp_buffer, data)
+                        self.logger.info(f"Max retries reached for fetch {req.url=}, giving up.")
+                    continue
+                if self.logger:
+                    self.logger.info(f"Retrying fetch {req.url=}, attempt {req.num_fetch + 1}/{self.max_retries}")
+                
+                req = KahReq(url=req.url, callback=req.callback, onerror=req.onerror, num_fetch=req.num_fetch + 1)
+                self.fetch_positive_counter += 1 # Go up further (lowest priority)
+                await self.queue.put((self.fetch_positive_counter, req)) # Queue again
+            except ToskipException:
+                if self.logger:
+                    self.logger.debug(f"Skipping fetch {req.url=}, as requested.")
+            except Exception:
+                pass # don't crash
             finally:
                 self.queue.task_done() # Notify completion
+
 
 class CongestionController:
     """Rate limit on fetch fails, inspired by AIMD-type algorithms."""
@@ -207,26 +252,49 @@ class KahRatelimitedFetcher(KahBaseFetcher):
                 )
         cc = KahRatelimitedFetcher.congestion_controllers[domain]
 
-        try:
-            await cc.consume() # Wait for corresponding time
+        for i in range(self.max_retries): # At most self.max_retries retry
+            if i > 0 and self.logger:
+                self.logger.info(f"Retrying fetch {url=}, attempt {i+1}/{self.max_retries}")
+            try: 
+                try:
+                    await cc.consume() # Wait for corresponding time
 
-            resp_buffer, data = None, None # default in case of exception
-            async with self.session.get(url) as resp:
-                resp_buffer = resp
-                data = await resp.read()
-                if self.logger:
-                    self.logger.info(f"Fetched {url} successfully. ({len(data)} bytes)")
-            return resp_buffer, data
-        
-        except Exception as e:
-            await onerror(self, url, e, resp_buffer, data)
+                    resp_buffer, data = None, None # default in case of exception
+                    async with self.session.get(url) as resp:
+                        resp_buffer = resp
+                        data = await resp.read()
+                        if self.logger:
+                            self.logger.info(f"Fetched {url} successfully. ({len(data)} bytes)")
+                        cc.on_fetch_success()
+                    return resp_buffer, data
+                
+                except Exception as e:
+                    cc.on_fetch_failure()
+                    await onerror(self, url, e, resp_buffer, data)
+                    raise ToretryException(i)
+                
+            except ToretryException: # Try again
+                await asyncio.sleep(0.1) # Allow asyncio to do something else
+                continue
+            except Exception:
+                pass # Prevent crash
+                continue
+        if self.logger:
+            self.logger.info(f"Max retries reached for fetch {url=}, giving up.")
+
 
     async def _worker(self):
         """Worker instance"""
+        self._worker_count += 1
+        worker_id = self._worker_count
+
         while True:
-            req = await self.queue.get()
+            item = await self.queue.get()
+            req = item[1]
             if req is None: # Shutdown signal
                 self.queue.task_done() # Notify completion
+                if self.logger:
+                    self.logger.info(f"Worker {worker_id} shutting down.")
                 break
 
             domain = get_domain(req.url) # Get domain
@@ -239,20 +307,36 @@ class KahRatelimitedFetcher(KahBaseFetcher):
             cc = KahRatelimitedFetcher.congestion_controllers[domain]
 
             try:
-                await cc.consume() # Wait for corresponding time
+                try:
+                    await cc.consume() # Wait for corresponding time
 
-                resp_buffer, data = None, None # default in case of exception
-                async with self.session.get(req.url) as resp:
-                    resp_buffer = resp
-                    data = await resp.read()
+                    resp_buffer, data = None, None # default in case of exception
+                    async with self.session.get(req.url) as resp:
+                        resp_buffer = resp
+                        data = await resp.read()
+                        if self.logger:
+                            self.logger.info(f"Fetched {req.url} successfully. ({len(data)} bytes)")
+                            cc.on_fetch_success()
+                        await req.callback(self, resp, data)
+                except Exception as e:
+                    cc.on_fetch_failure()
+                    await req.onerror(self, req.url, e, resp_buffer, data)
+                    raise ToretryException(req.num_fetch)
+
+            except ToretryException:
+                if req.num_fetch >= self.max_retries:
                     if self.logger:
-                        self.logger.info(f"Fetched {req.url} successfully. ({len(data)} bytes)")
-                    cc.on_fetch_success()
-
-                    await req.callback(self, resp, data)
-            except Exception as e:
-                cc.on_fetch_failure()
-                await req.onerror(self, req.url, e, resp_buffer, data)
+                        self.logger.info(f"Max retries reached for fetch {req.url=}, giving up.")
+                    continue
+                if self.logger:
+                    self.logger.info(f"Retrying fetch {req.url=}, attempt {req.num_fetch+1}/{self.max_retries}")
+                
+                req = KahReq(url=req.url, callback=req.callback, onerror=req.onerror, num_fetch=req.num_fetch + 1)
+                self.fetch_positive_counter += 1 # Go up further (lowest priority)
+                await self.queue.put((self.fetch_positive_counter, req)) # Queue again
+            except ToskipException:
+                if self.logger:
+                    self.logger.debug(f"Skipping fetch {req.url=}, as requested.")
             finally:
                 self.queue.task_done() # Notify completion
 
@@ -265,3 +349,14 @@ class KahRatelimitedFetcher(KahBaseFetcher):
         """Declare a success when fetching externally."""
         domain = get_domain(url_or_domain) # Get domain
         KahRatelimitedFetcher.congestion_controllers[domain].on_fetch_success()
+
+
+
+
+
+
+
+
+# TODO NOW:
+# The exception hadling ndoes not work correctly, retries are never notified / logged for some reason
+# do : try merging the try, having only 1 layer (smart priority management)
