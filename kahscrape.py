@@ -103,7 +103,7 @@ class KahBaseFetcher(FetcherABC):
                 await asyncio.sleep(0.1) # Allow asyncio to do something else
                 continue
         if self.logger:
-            self.logger.info(f"Max retries reached for fetch {url=}, giving up.")
+            self.logger.critical(f"Max retries reached for fetch {url=}, giving up.")
 
     @override
     async def close(self) -> None:
@@ -152,7 +152,7 @@ class KahBaseFetcher(FetcherABC):
             except ToretryException:
                 if req.num_fetch >= self.max_retries:
                     if self.logger:
-                        self.logger.info(f"Max retries reached for fetch {req.url=}, giving up.")
+                        self.logger.critical(f"Max retries reached for fetch {req.url=}, giving up.")
                     continue
                 if self.logger:
                     self.logger.info(f"Retrying fetch {req.url=}, attempt {req.num_fetch + 1}/{self.max_retries}")
@@ -280,7 +280,7 @@ class KahRatelimitedFetcher(KahBaseFetcher):
                 pass # Prevent crash
                 continue
         if self.logger:
-            self.logger.info(f"Max retries reached for fetch {url=}, giving up.")
+            self.logger.critical(f"Max retries reached for fetch {url=}, giving up.")
 
 
     async def _worker(self):
@@ -326,7 +326,7 @@ class KahRatelimitedFetcher(KahBaseFetcher):
             except ToretryException:
                 if req.num_fetch >= self.max_retries:
                     if self.logger:
-                        self.logger.info(f"Max retries reached for fetch {req.url=}, giving up.")
+                        self.logger.critical(f"Max retries reached for fetch {req.url=}, giving up.")
                     continue
                 if self.logger:
                     self.logger.info(f"Retrying fetch {req.url=}, attempt {req.num_fetch+1}/{self.max_retries}")
