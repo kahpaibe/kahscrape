@@ -95,8 +95,8 @@ class KahBaseFetcher(FetcherABC):
                             self.logger.info(f"Fetched {url} successfully. ({len(data)} bytes)")
                     return resp_buffer, data
                 
-                except Exception as e:
-                    await onerror(self, url, e, resp_buffer, data)
+                except Exception:
+                    # await onerror(self, url, e, resp_buffer, data)
                     raise ToretryException(i)
                 
             except ToretryException: # Try again
@@ -104,6 +104,7 @@ class KahBaseFetcher(FetcherABC):
                 continue
         if self.logger:
             self.logger.critical(f"Max retries reached for fetch {url=}, giving up.")
+        await onerror(self, url, Exception("Max retry count reached"), None, None)
 
     @override
     async def close(self) -> None:
@@ -144,15 +145,16 @@ class KahBaseFetcher(FetcherABC):
                         data = await resp.read()
                         if self.logger:
                             self.logger.info(f"Fetched {req.url} successfully. ({len(data)} bytes)")
-                        await req.callback(self, resp, data)
+                        await req.callback(self, resp_buffer, data)
                 except Exception as e:
-                    await req.onerror(self, req.url, e, resp_buffer, data)
+                    # await req.onerror(self, req.url, e, resp_buffer, data) # Don't raise error when attempts left
                     raise e # Go up
 
-            except ToretryException:
+            except ToretryException as te:
                 if req.num_fetch >= self.max_retries:
                     if self.logger:
                         self.logger.critical(f"Max retries reached for fetch {req.url=}, giving up.")
+                    await req.onerror(self, req.url, te, None, None)
                     continue
                 if self.logger:
                     self.logger.info(f"Retrying fetch {req.url=}, attempt {req.num_fetch + 1}/{self.max_retries}")
@@ -268,9 +270,9 @@ class KahRatelimitedFetcher(KahBaseFetcher):
                         cc.on_fetch_success()
                     return resp_buffer, data
                 
-                except Exception as e:
+                except Exception:
                     cc.on_fetch_failure()
-                    await onerror(self, url, e, resp_buffer, data)
+                    # await onerror(self, url, e, resp_buffer, data) # Don't raise error when attempts left
                     raise ToretryException(i)
                 
             except ToretryException: # Try again
@@ -281,6 +283,7 @@ class KahRatelimitedFetcher(KahBaseFetcher):
                 continue
         if self.logger:
             self.logger.critical(f"Max retries reached for fetch {url=}, giving up.")
+        await onerror(self, url, Exception("Max retry count reached"), None, None)
 
 
     async def _worker(self):
@@ -317,16 +320,17 @@ class KahRatelimitedFetcher(KahBaseFetcher):
                         if self.logger:
                             self.logger.info(f"Fetched {req.url} successfully. ({len(data)} bytes)")
                             cc.on_fetch_success()
-                        await req.callback(self, resp, data)
-                except Exception as e:
+                        await req.callback(self, resp_buffer, data)
+                except Exception:
                     cc.on_fetch_failure()
-                    await req.onerror(self, req.url, e, resp_buffer, data)
+                    # await req.onerror(self, req.url, e, resp_buffer, data) # Don't raise error when attempts left
                     raise ToretryException(req.num_fetch)
 
-            except ToretryException:
+            except ToretryException as te:
                 if req.num_fetch >= self.max_retries:
                     if self.logger:
                         self.logger.critical(f"Max retries reached for fetch {req.url=}, giving up.")
+                    await req.onerror(self, req.url, te, None, None)
                     continue
                 if self.logger:
                     self.logger.info(f"Retrying fetch {req.url=}, attempt {req.num_fetch+1}/{self.max_retries}")

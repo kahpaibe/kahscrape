@@ -39,13 +39,13 @@ class FetcherABC(ABC):
         """Add fetch from non async context"""
         asyncio.run(self.fetch(url, callback, onerror))
 
-class ToretryException(BaseException):
+class ToretryException(Exception):
     """Exception to raise when pipeline fails, to ask the Fetcher to try to download the page again."""
     def __init__(self, attempt_count: int | None, *args: object) -> None:
         super().__init__(*args)
         self.attempt_count = attempt_count # Number of times the ressource was refetched
 
-class ToskipException(BaseException):
+class ToskipException(Exception):
     """Exception to raise when pipeline fails, to ask the Fetcher to skip the resource."""
     def __init__(self, *args: object) -> None:
         super().__init__(*args)
