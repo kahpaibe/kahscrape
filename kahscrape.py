@@ -64,7 +64,7 @@ class KahBaseFetcher(FetcherABC):
                 self.logger.warning(f"Fetcher is not running, cannot add fetch request. {url=}")
             return
         if self.logger:
-            self.logger.info(f"Adding new fetch to queue. {url=}")
+            self.logger.debug(f"Adding new fetch to queue. {url=}")
 
         req = KahReq(url=url, callback=callback, onerror=onerror)
         self.fetch_negative_counter -= 1 # Go down further (highest priority)
