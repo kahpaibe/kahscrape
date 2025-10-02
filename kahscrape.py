@@ -82,6 +82,7 @@ class KahBaseFetcher(FetcherABC):
         if self.logger:
             self.logger.info(f"Fetching url {url=}")
 
+        error = None
         for i in range(self.max_retries): # At most self.max_retries retry
             if i > 0 and self.logger:
                 self.logger.info(f"Retrying fetch {url=}, attempt {i+1}/{self.max_retries}")
@@ -95,16 +96,17 @@ class KahBaseFetcher(FetcherABC):
                             self.logger.info(f"Fetched {url} successfully. ({len(data)} bytes)")
                     return resp_buffer, data
                 
-                except Exception:
+                except Exception as e:
                     # await onerror(self, url, e, resp_buffer, data)
-                    raise ToretryException(i)
+                    raise ToretryException(i, f"Fetch failure {e}")
                 
-            except ToretryException: # Try again
+            except ToretryException as te: # Try again
+                error = te
                 await asyncio.sleep(0.1) # Allow asyncio to do something else
                 continue
         if self.logger:
-            self.logger.critical(f"Max retries reached for fetch {url=}, giving up.")
-        await onerror(self, url, Exception("Max retry count reached"), None, None)
+            self.logger.critical(f"Max retries reached for fetch {url=}, giving up. {error:}")
+        await onerror(self, url, Exception(f"Max retry count reached {error:}"), None, None)
 
     @override
     async def close(self) -> None:
@@ -321,10 +323,10 @@ class KahRatelimitedFetcher(KahBaseFetcher):
                             self.logger.info(f"Fetched {req.url} successfully. ({len(data)} bytes)")
                             cc.on_fetch_success()
                         await req.callback(self, resp_buffer, data)
-                except Exception:
+                except Exception as e:
                     cc.on_fetch_failure()
                     # await req.onerror(self, req.url, e, resp_buffer, data) # Don't raise error when attempts left
-                    raise ToretryException(req.num_fetch)
+                    raise ToretryException(req.num_fetch, f"Fetch failure {e:}")
 
             except ToretryException as te:
                 if req.num_fetch >= self.max_retries:
