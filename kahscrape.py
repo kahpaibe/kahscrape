@@ -25,6 +25,7 @@ class KahBaseFetcher(FetcherABC):
                  timeout: float = 10.0,
                  session: Optional[ClientSession] = None,
                  max_retries: int = 5,
+                 should_skip_empty: bool = True,
                  logger: Optional[Logger] = None) -> None:
         """Base async fetcher.
         
@@ -33,10 +34,12 @@ class KahBaseFetcher(FetcherABC):
             timeout (float): Timeout for fetch (for unset session).
             session (Optional[ClientSession]): Optional aiohttp ClientSession.
             max_retries (int): Maximum number of retries for failed requests.
+            should_skip_empty (bool): Whether to skip empty (0 bytes) responses.
             logger (Optional[Logger]): Optional Logger.
         """
         super().__init__()
         self.logger = logger
+        self.should_skip_empty = should_skip_empty
         self.session = session if session is not None else aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout))
         self.num_workers: int = num_workers
         self.running = True
@@ -92,6 +95,8 @@ class KahBaseFetcher(FetcherABC):
                     async with self.session.get(url) as resp:
                         resp_buffer = resp
                         data = await resp.read()
+                        if len(data) == 0 and self.should_skip_empty:
+                            raise ToretryException(i, "Empty response")
                         if self.logger:
                             self.logger.info(f"Fetched {url} successfully. ({len(data)} bytes)")
                     return resp_buffer, data
@@ -145,6 +150,8 @@ class KahBaseFetcher(FetcherABC):
                     async with self.session.get(req.url) as resp:
                         resp_buffer = resp
                         data = await resp.read()
+                        if len(data) == 0 and self.should_skip_empty:
+                            raise ToretryException(req.num_fetch, "Empty response")
                         if self.logger:
                             self.logger.info(f"Fetched {req.url} successfully. ({len(data)} bytes)")
                         await req.callback(self, resp_buffer, data)
@@ -227,8 +234,9 @@ class KahRatelimitedFetcher(KahBaseFetcher):
                  cc_max_wait_time: float = 0.5,
                  cc_backoff_factor: float = 2.0,
                  cc_success_additive_decrease: float = 0.5,
+                 should_skip_empty: bool = True,
                  logger: Optional[Logger] = None) -> None:
-        super().__init__(num_workers, timeout, session, logger=logger)
+        super().__init__(num_workers, timeout, session, should_skip_empty=should_skip_empty, logger=logger)
         self.cc_min_wait_time = cc_min_wait_time
         self.cc_max_wait_time = cc_max_wait_time
         self.cc_backoff_factor = cc_backoff_factor
@@ -267,6 +275,8 @@ class KahRatelimitedFetcher(KahBaseFetcher):
                     async with self.session.get(url) as resp:
                         resp_buffer = resp
                         data = await resp.read()
+                        if len(data) == 0 and self.should_skip_empty:
+                            raise ToretryException(i, "Empty response")
                         if self.logger:
                             self.logger.info(f"Fetched {url} successfully. ({len(data)} bytes)")
                         cc.on_fetch_success()
@@ -319,6 +329,8 @@ class KahRatelimitedFetcher(KahBaseFetcher):
                     async with self.session.get(req.url) as resp:
                         resp_buffer = resp
                         data = await resp.read()
+                        if len(data) == 0 and self.should_skip_empty:
+                            raise ToretryException(req.num_fetch, "Empty response")
                         if self.logger:
                             self.logger.info(f"Fetched {req.url} successfully. ({len(data)} bytes)")
                             cc.on_fetch_success()
@@ -355,14 +367,3 @@ class KahRatelimitedFetcher(KahBaseFetcher):
         """Declare a success when fetching externally."""
         domain = get_domain(url_or_domain) # Get domain
         KahRatelimitedFetcher.congestion_controllers[domain].on_fetch_success()
-
-
-
-
-
-
-
-
-# TODO NOW:
-# The exception hadling ndoes not work correctly, retries are never notified / logged for some reason
-# do : try merging the try, having only 1 layer (smart priority management)
